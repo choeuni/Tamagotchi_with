@@ -1,0 +1,43 @@
+name: tamawith
+description: "졸작1"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  http: ^1.1.0
+  shared_preferences: ^2.2.2
+  camera: ^0.11.0
+  web_socket_channel: ^3.0.1
+
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  # 이미지 설정
+  assets:
+    - assets/images/
+    - assets/images/tama_back.png
+    - assets/images/tama_bored.png
+    - assets/images/tama_clean.png
+    - assets/images/tama_eat.png
+    - assets/images/tama_happy.png
+    - assets/images/icon_camera.png
+
+  # 폰트 설정
+  fonts:
+    - family: MyCustomFont
+      fonts:
+        - asset: assets/fonts/memomentkkukkukk.otf
