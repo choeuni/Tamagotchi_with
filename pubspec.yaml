@@ -14,9 +14,9 @@ dependencies:
   http: ^1.1.0
   shared_preferences: ^2.2.2
   camera: ^0.11.0
-  web_socket_channel: ^3.0.1
-
-
+  web_socket_channel: ^3.0.3
+  model_viewer_plus: ^1.10.0
+  google_generative_ai: ^0.4.0
 
 dev_dependencies:
   flutter_test:
@@ -35,6 +35,7 @@ flutter:
     - assets/images/tama_eat.png
     - assets/images/tama_happy.png
     - assets/images/icon_camera.png
+    - assets/models/tama1.glb
 
   # 폰트 설정
   fonts:
