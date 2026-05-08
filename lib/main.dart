@@ -2,8 +2,18 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:camera/camera.dart';
+import 'camera_screen.dart';
 
-void main() {
+List<CameraDescription> cameras = [];
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    debugPrint("Failed to load cameras: $e");
+  }
   runApp(const MyApp());
 }
 
@@ -15,7 +25,7 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        scaffoldBackgroundColor: const Color(0xFFFFF9F0),
+        scaffoldBackgroundColor: Colors.white, // 기본 깔끔한 흰색 배경
         fontFamily: 'MyCustomFont',
       ),
       home: const TamagotchiMain(),
@@ -31,11 +41,19 @@ class TamagotchiMain extends StatefulWidget {
 }
 
 class _TamagotchiMainState extends State<TamagotchiMain> {
-  // 1. 상태 변수 (서버 DB와 동기화될 값들)
+  // 1. 상태 변수 (서버 DB와 동기화될 값들 포함)
   int level = 1;
-  int diamonds = 0;
+  int diamonds = 0; // UI에서는 숨김 처리
   int gold = 0;
+
+  // 상태 게이지를 위한 변수들 (0 ~ 100)
+  int mood = 80;
   int fullness = 50;
+  int hygiene = 100;
+  int energy = 70;
+
+  // 파스텔 하늘색 테마 컬러
+  final Color primaryColor = const Color(0xFF87CEEB);
 
   // 2. WebSocket 채널 설정
   final WebSocketChannel channel = WebSocketChannel.connect(
@@ -60,25 +78,16 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
           if (decoded['diamonds'] != null) {
             diamonds = decoded['diamonds'];
           }
+          // TODO: 서버에서 mood, hygiene, energy 값을 내려주면 여기서 파싱하여 연동
         });
       },
       onError: (error) {
-        print("WebSocket 에러: $error");
+        // 에러 처리
       },
     );
   }
 
-  // 4. 재화 증가 함수 (서버에 알림 전송)
-  void _earnReward() {
-    final message = jsonEncode({
-      "action": "EARN_REWARD",
-      "gold_gain": 100,
-      "diamond_gain": 10,
-    });
-    channel.sink.add(message);
-  }
-
-  // 5. 식사 함수 (서버에 FEED 신호 전송)
+  // 4. 식사 함수 (서버에 FEED 신호 전송)
   void _feedTamagotchi() {
     final message = jsonEncode({"action": "FEED"});
     channel.sink.add(message);
@@ -93,61 +102,59 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: SafeArea(
-        child: Column(
-          children: [
-            _buildTopBar(),
-            _buildFullnessGauge(),
-            Expanded(
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  // 바닥 그림자
-                  Positioned(
-                    bottom: 40,
-                    child: Container(
-                      width: 220,
-                      height: 60,
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.08),
-                        borderRadius: const BorderRadius.all(
-                          Radius.elliptical(220, 60),
+      body: Container(
+        // 개발자 참고: 추후 배경 이미지를 삽입할 경우 아래 주석을 해제하고 이미지를 적용하세요.
+        decoration: const BoxDecoration(
+          color: Color(0xFFF9FAFB), // 토스 스타일의 아주 연한 회색 배경
+          // image: DecorationImage(
+          //   image: AssetImage('assets/images/background_placeholder.png'),
+          //   fit: BoxFit.cover,
+          // ),
+        ),
+        child: SafeArea(
+          child: Column(
+            children: [
+              _buildTopBar(),
+              Expanded(
+                child: Center(
+                  child: SizedBox(
+                    // 기존 크기의 약 1/2 수준으로 축소 (가로세로 250 내외)
+                    width: 250,
+                    height: 250,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        // 바닥 그림자 (작게 조정)
+                        Positioned(
+                          bottom: 10,
+                          child: Container(
+                            width: 120,
+                            height: 30,
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.06),
+                              borderRadius: const BorderRadius.all(
+                                Radius.elliptical(120, 30),
+                              ),
+                            ),
+                          ),
                         ),
-                      ),
+                        // 3D 모델
+                        const ModelViewer(
+                          src: 'assets/models/TAMA1_stop.glb',
+                          alt: "다마고치 캐릭터",
+                          autoRotate: false,
+                          cameraControls: true,
+                          disableZoom: true,
+                          backgroundColor: Colors.transparent,
+                        ),
+                      ],
                     ),
                   ),
-                  // 3D 모델
-                  const ModelViewer(
-                    src: 'assets/models/tama1.glb',
-                    alt: "다마고치 캐릭터",
-                    autoRotate: false,
-                    cameraControls: true,
-                    disableZoom: true,
-                    backgroundColor: Colors.transparent,
-                  ),
-                  // 테스트용 재화 증가 버튼
-                  Positioned(
-                    bottom: 80,
-                    right: 24,
-                    child: FloatingActionButton(
-                      elevation: 2,
-                      backgroundColor: const Color(0xFFFFB4A2),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      onPressed: _earnReward,
-                      child: const Icon(
-                        Icons.add_shopping_cart,
-                        color: Colors.white,
-                        size: 24,
-                      ),
-                    ),
-                  ),
-                ],
+                ),
               ),
-            ),
-            _buildBottomMenu(),
-          ],
+              _buildBottomMenu(),
+            ],
+          ),
         ),
       ),
     );
@@ -157,43 +164,51 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 16.0),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          _buildTopIcon(
-            Icons.stars_rounded,
-            "Lv. $level",
-            const Color(0xFF7CAFFF),
-          ),
-          Row(
+          // 좌측 영역: 레벨 + 상점/카메라 버튼 (세로 배치, 텍스트 없음)
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildTopIcon(
-                Icons.diamond_rounded,
-                "$diamonds",
-                const Color(0xFFFF9EB5),
-              ),
-              const SizedBox(width: 12),
-              _buildTopIcon(
-                Icons.monetization_on_rounded,
-                "$gold",
-                const Color(0xFFFFC56C),
-              ),
+              _buildTopChip(Icons.stars_rounded, "Lv. $level", primaryColor),
+              const SizedBox(height: 16),
+              _buildIconButton(Icons.storefront_rounded, () {
+                // 상점 로직
+              }),
+              const SizedBox(height: 12),
+              _buildIconButton(Icons.camera_alt_rounded, () {
+                // AR 카메라 화면으로 이동
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const ARCameraScreen(),
+                  ),
+                );
+              }),
             ],
+          ),
+          // 우측 영역: 재화 (골드 하나로 통일)
+          _buildTopChip(
+            Icons.monetization_on_rounded,
+            "$gold",
+            const Color(0xFFF6A000),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildTopIcon(IconData icon, String text, Color color) {
+  Widget _buildTopChip(IconData icon, String text, Color iconColor) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(24),
+        borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.04),
-            blurRadius: 8,
+            blurRadius: 10,
             offset: const Offset(0, 2),
           ),
         ],
@@ -201,14 +216,14 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: color, size: 20),
+          Icon(icon, color: iconColor, size: 20),
           const SizedBox(width: 6),
           Text(
             text,
             style: const TextStyle(
               fontWeight: FontWeight.w700,
-              fontSize: 14,
-              color: Color(0xFF555555),
+              fontSize: 15,
+              color: Color(0xFF333D4B), // 진한 텍스트
             ),
           ),
         ],
@@ -216,72 +231,24 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
     );
   }
 
-  Widget _buildFullnessGauge() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+  // 텍스트 없이 둥근 아이콘만 남긴 버튼 (onTap 파라미터 추가)
+  Widget _buildIconButton(IconData icon, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
           color: Colors.white,
-          borderRadius: BorderRadius.circular(20),
+          shape: BoxShape.circle, // 둥근 원형
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.03),
-              blurRadius: 10,
-              offset: const Offset(0, 4),
+              color: Colors.black.withValues(alpha: 0.05),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
             ),
           ],
         ),
-        child: Row(
-          children: [
-            const Icon(
-              Icons.restaurant_menu_rounded,
-              color: Color(0xFFA5D6A7),
-              size: 24,
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text(
-                        "배고픔",
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                          color: Color(0xFF666666),
-                        ),
-                      ),
-                      Text(
-                        "$fullness%",
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                          color: Color(0xFFA5D6A7),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(10),
-                    child: LinearProgressIndicator(
-                      value: fullness / 100,
-                      minHeight: 10,
-                      backgroundColor: const Color(0xFFF0F0F0),
-                      valueColor: const AlwaysStoppedAnimation<Color>(
-                        Color(0xFFA5D6A7),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
+        child: Icon(icon, color: const Color(0xFF8B95A1), size: 20),
       ),
     );
   }
@@ -289,51 +256,30 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
   Widget _buildBottomMenu() {
     return Container(
       margin: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 12),
+      padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(30),
+        borderRadius: BorderRadius.circular(24),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.05),
-            blurRadius: 15,
-            offset: const Offset(0, 5),
+            color: Colors.black.withValues(alpha: 0.06),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
           ),
         ],
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: [
-          _buildMenuIcon(
-            Icons.face_rounded,
-            "기분",
-            const Color(0xFFFFB4A2),
-            null,
-          ),
+          _buildMenuIcon(Icons.face_rounded, "기분", mood / 100.0, null),
           _buildMenuIcon(
             Icons.restaurant_rounded,
             "식사",
-            const Color(0xFFA5D6A7),
+            fullness / 100.0,
             _feedTamagotchi,
           ),
-          _buildMenuIcon(
-            Icons.wc_rounded,
-            "화장실",
-            const Color(0xFF90CAF9),
-            null,
-          ),
-          _buildMenuIcon(
-            Icons.dark_mode_rounded,
-            "취침",
-            const Color(0xFFB39DDB),
-            null,
-          ),
-          _buildMenuIcon(
-            Icons.home_rounded,
-            "외출",
-            const Color(0xFFF48FB1),
-            null,
-          ),
+          _buildMenuIcon(Icons.wc_rounded, "화장실", hygiene / 100.0, null),
+          _buildMenuIcon(Icons.dark_mode_rounded, "취침", energy / 100.0, null),
         ],
       ),
     );
@@ -342,30 +288,60 @@ class _TamagotchiMainState extends State<TamagotchiMain> {
   Widget _buildMenuIcon(
     IconData icon,
     String label,
-    Color color,
+    double percentage,
     VoidCallback? onTap,
   ) {
+    // 안전을 위해 0.0 ~ 1.0 범위로 클램핑
+    final safePercentage = percentage.clamp(0.0, 1.0);
+
     return GestureDetector(
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.15),
-              shape: BoxShape.circle,
+          // 내부에 게이지가 차오르는 둥근 네모 컨테이너
+          SizedBox(
+            width: 56,
+            height: 56,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Stack(
+                children: [
+                  // 기본 배경 (연한 회색)
+                  Container(color: const Color(0xFFF2F4F6)),
+                  // 차오르는 게이지 (바닥에서부터)
+                  Align(
+                    alignment: Alignment.bottomCenter,
+                    child: FractionallySizedBox(
+                      heightFactor: safePercentage,
+                      widthFactor: 1.0,
+                      child: Container(
+                        color: primaryColor, // 파스텔 하늘색
+                      ),
+                    ),
+                  ),
+                  // 중앙의 아이콘
+                  Center(
+                    child: Icon(
+                      icon,
+                      color: safePercentage > 0.5
+                          ? Colors.white
+                          : const Color(0xFF4E5968), // 게이지에 따라 아이콘 색상 변경
+                      size: 28,
+                    ),
+                  ),
+                ],
+              ),
             ),
-            child: Icon(icon, color: color, size: 26),
           ),
           const SizedBox(height: 8),
           Text(
             label,
             style: const TextStyle(
-              fontSize: 12,
+              fontSize: 13,
               fontWeight: FontWeight.w600,
-              color: Color(0xFF777777),
+              color: Color(0xFF4E5968),
             ),
           ),
         ],

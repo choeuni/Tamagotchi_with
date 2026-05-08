@@ -17,11 +17,21 @@ dependencies:
   web_socket_channel: ^3.0.3
   model_viewer_plus: ^1.10.0
   google_generative_ai: ^0.4.0
+  google_mlkit_pose_detection: ^0.14.1
+  ar_flutter_plugin_2: ^0.0.1
+  vector_math: ^2.1.4
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/logo/TAMAwith_LOGO.jpg"
+  min_sdk_android: 21 # android min sdk documentation
 
 flutter:
   uses-material-design: true
@@ -35,6 +45,13 @@ flutter:
     - assets/images/tama_eat.png
     - assets/images/tama_happy.png
     - assets/images/icon_camera.png
+    - assets/logo/
+    - assets/models/
+    - assets/models/TAMA1_stop.glb
+    - assets/models/TAMA1_Casual_Walk.glb
+    - assets/models/TAMA1_Big_Wave_Hello.glb
+    - assets/models/TAMA1_Skip_Forward.glb
+    - assets/models/TAMA1_Wave_One_Hand.glb
     - assets/models/tama1.glb
 
   # 폰트 설정
