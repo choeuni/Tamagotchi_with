@@ -114,6 +114,13 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
 
   // 모델 교체 시 모든 파라미터를 명시적으로 고정
   Future<void> _updateCharacterModel(String modelPath, {required vector.Vector3 position, required double yaw}) async {
+    // 이미 같은 모델이 표시 중이라면 위치와 회전만 업데이트하여 깜빡임 방지
+    if (_characterNode != null && _characterNode!.uri == modelPath) {
+      _characterNode!.position = position;
+      _characterNode!.eulerAngles = vector.Vector3(0, yaw, 0);
+      return;
+    }
+
     // 1. 이전 노드 제거
     if (_characterNode != null) {
       await arObjectManager?.removeNode(_characterNode!);
@@ -143,11 +150,11 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
     final lastPos = _characterNode!.position;
     final lastYaw = _characterNode!.eulerAngles.y;
 
-    await _updateCharacterModel("assets/models/TAMA1_Wave_One_Hand.glb", position: lastPos, yaw: lastYaw);
+    await _updateCharacterModel("assets/models/TAMA1_Big_Wave_Hello.glb", position: lastPos, yaw: lastYaw);
     await Future.delayed(const Duration(seconds: 4));
 
     if (mounted) {
-      await _updateCharacterModel("assets/models/TAMA1_stop.glb", position: lastPos, yaw: lastYaw);
+      await _updateCharacterModel("assets/models/TAMA1_Casual_Walk.glb", position: lastPos, yaw: lastYaw);
       setState(() { _statusMessage = "다마고치와 함께 놀아요!"; });
       _isActionExecuting = false;
       _startWandering();
