@@ -34,7 +34,7 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
   ARNode? _characterNode;
   ARPlaneAnchor? _currentAnchor;
   bool _isCharacterPlaced = false;
-  String _statusMessage = "바닥을 찾는 중입니다...";
+  String _statusMessage = "화면을 터치하여 다마고치를 소환하세요!";
   
   Timer? _wanderTimer;
   bool _isActionExecuting = false;
@@ -43,8 +43,8 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
   final PoseDetector _poseDetector = PoseDetector(options: PoseDetectorOptions());
   bool _isBusy = false;
 
-  // 크기 조정 (0.002 -> 0.008로 상향)
-  static final vector.Vector3 _fixedScale = vector.Vector3(0.008, 0.008, 0.008);
+  // 크기 조정 (0.008 -> 0.002로 하향: 너무 큰 문제 해결)
+  static final vector.Vector3 _fixedScale = vector.Vector3(0.002, 0.002, 0.002);
 
   @override
   void initState() {
@@ -198,16 +198,21 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
     this.arObjectManager!.onInitialize();
 
     this.arSessionManager!.onPlaneOrPointTap = (List<ARHitTestResult> hits) {
-      if (!_isCharacterPlaced && hits.isNotEmpty) {
-        ARHitTestResult? bestHit;
-        try {
-          bestHit = hits.firstWhere((element) => element.type == ARHitTestResultType.plane);
-        } catch (e) {
-          bestHit = hits.first;
-        }
-        
-        if (bestHit != null) {
-          _addAnchorAndNode(bestHit);
+      if (_isCharacterPlaced) return;
+
+      if (hits.isNotEmpty) {
+        // 1. 가장 좋은 히트 결과 찾기 (평면 우선, 없으면 첫 번째 결과)
+        ARHitTestResult bestHit = hits.firstWhere(
+          (hit) => hit.type == ARHitTestResultType.plane,
+          orElse: () => hits.first,
+        );
+        _addAnchorAndNode(bestHit);
+      } else {
+        // 히트 결과가 없는 경우 사용자에게 알림
+        if (mounted) {
+          setState(() {
+            _statusMessage = "바닥 인식이 더 필요합니다. 카메라를 조금 움직여주세요.";
+          });
         }
       }
     };
@@ -216,7 +221,7 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
       if (!_isCharacterPlaced && planeCount > 0) {
         if (mounted) {
           setState(() {
-            _statusMessage = "바닥이 감지되었습니다! 화면을 터치하여 소환하세요.";
+            _statusMessage = "바닥을 찾았습니다! 원하는 곳을 터치하세요.";
           });
         }
       }
@@ -227,6 +232,7 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
     if (_isCharacterPlaced) return;
     _isCharacterPlaced = true;
     
+    // hitResult.type에 상관없이 최대한 앵커 생성을 시도하여 빠른 소환 지원
     _currentAnchor = ARPlaneAnchor(transformation: hitResult.worldTransform);
     bool? didAddAnchor = await arAnchorManager?.addAnchor(_currentAnchor!);
     
@@ -251,6 +257,11 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
       }
     } else {
       _isCharacterPlaced = false;
+      if (mounted) {
+        setState(() {
+          _statusMessage = "소환 실패. 다른 곳을 터치해보세요.";
+        });
+      }
     }
   }
 
@@ -341,12 +352,10 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
                   children: [
                     const CircularProgressIndicator(color: Colors.white),
                     const SizedBox(height: 16),
-                    Text(
-                      _statusMessage == "바닥이 감지되었습니다! 화면을 터치하여 소환하세요."
-                        ? "화면을 터치하면 캐릭터가 소환됩니다!"
-                        : "바닥을 천천히 비춰주세요...",
+                    const Text(
+                      "캐릭터를 소환할 위치를 터치하세요!\n(바닥을 비추며 터치하면 더 정확합니다)",
                       textAlign: TextAlign.center,
-                      style: const TextStyle(
+                      style: TextStyle(
                         color: Colors.white,
                         fontSize: 16,
                         fontWeight: FontWeight.bold,

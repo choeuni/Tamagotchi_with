@@ -39,6 +39,7 @@ flutter:
   # 이미지 설정
   assets:
     - assets/images/
+    - assets/backs/
     - assets/images/tama_back.png
     - assets/images/tama_bored.png
     - assets/images/tama_clean.png
