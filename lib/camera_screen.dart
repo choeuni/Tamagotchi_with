@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'package:ar_flutter_plugin_2/ar_flutter_plugin.dart';
 import 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
@@ -15,13 +16,16 @@ import 'package:ar_flutter_plugin_2/widgets/ar_view.dart';
 import 'package:flutter/material.dart';
 import 'package:vector_math/vector_math_64.dart' as vector;
 import 'package:camera/camera.dart';
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
-import 'package:flutter/foundation.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 import 'main.dart';
+
+// 서버 주소 — ngrok 사용 시 아래 URL을 교체하세요
+// 실기기 테스트: ws://<컴퓨터 IP>:8000/ws/gesture
+// 에뮬레이터:   ws://10.0.2.2:8000/ws/gesture
+const _kWsUrl = 'ws://10.0.2.2:8000/ws/gesture';
 
 class ARCameraScreen extends StatefulWidget {
   const ARCameraScreen({super.key});
-
   @override
   State<ARCameraScreen> createState() => _ARCameraScreenState();
 }
@@ -34,157 +38,175 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
   ARNode? _characterNode;
   ARPlaneAnchor? _currentAnchor;
   bool _isCharacterPlaced = false;
-  String _statusMessage = "화면을 터치하여 다마고치를 소환하세요!";
-  
+  bool _isPlacing = false;
+  String _statusMessage = "바닥을 향해 카메라를 천천히 움직여 평면을 인식시키세요.";
+
   Timer? _wanderTimer;
+  Timer? _captureTimer;
   bool _isActionExecuting = false;
 
   CameraController? _frontCameraController;
-  final PoseDetector _poseDetector = PoseDetector(options: PoseDetectorOptions());
-  bool _isBusy = false;
+  WebSocketChannel? _wsChannel;
+  String? _expressionEmoji; // 표정 인식 결과 표시용
 
-  // 크기 조정 (0.008 -> 0.002로 하향: 너무 큰 문제 해결)
-  static final vector.Vector3 _fixedScale = vector.Vector3(0.002, 0.002, 0.002);
+  // 제스처별 모델 경로 & 상태 메시지
+  static const _gestureModels = {
+    'wave':     'assets/models/TAMA1_Big_Wave_Hello.glb',
+    'happy':    'assets/models/TAMA1_Skip_Forward.glb',
+    'fighting': 'assets/models/TAMA1_Skip_Forward.glb',
+    'love':     'assets/models/TAMA1_Wave_One_Hand.glb',
+  };
+  static const _gestureMessages = {
+    'wave':     '안녕! 다마고치가 인사합니다.',
+    'happy':    '브이! 다마고치가 신났어요!',
+    'fighting': '파이팅! 에너지가 올라갑니다!',
+    'love':     '❤️ 다마고치가 좋아합니다!',
+  };
+  static const _expressionEmojis = {
+    'happy': '😊', 'sad': '😢', 'angry': '😠',
+    'surprise': '😲', 'fear': '😨', 'disgust': '🤢', 'neutral': '😐',
+  };
+
+  static final _fixedScale = vector.Vector3(0.002, 0.002, 0.002);
 
   @override
   void initState() {
     super.initState();
+    _connectWebSocket();
     _initFrontCamera();
   }
 
   @override
   void dispose() {
     _wanderTimer?.cancel();
-    _poseDetector.close();
+    _captureTimer?.cancel();
     _frontCameraController?.dispose();
+    _wsChannel?.sink.close();
     arSessionManager?.dispose();
     super.dispose();
   }
 
+  // ── WebSocket ───────────────────────────────────────────────────────────────
+
+  void _connectWebSocket() {
+    try {
+      _wsChannel = WebSocketChannel.connect(Uri.parse(_kWsUrl));
+      _wsChannel!.stream.listen(
+        (data) {
+          final decoded = jsonDecode(data as String) as Map<String, dynamic>;
+          final gestureAction = decoded['gesture_action'] as String?;
+          final expression    = decoded['expression']     as String?;
+
+          if (gestureAction != null) _handleGestureAction(gestureAction);
+
+          if (expression != null && mounted) {
+            setState(() => _expressionEmoji = _expressionEmojis[expression]);
+            Future.delayed(const Duration(seconds: 3), () {
+              if (mounted) setState(() => _expressionEmoji = null);
+            });
+          }
+        },
+        onError: (e) => debugPrint("WS error: $e"),
+      );
+    } catch (e) {
+      debugPrint("WS connect failed: $e");
+    }
+  }
+
+  void _handleGestureAction(String action) {
+    final model   = _gestureModels[action];
+    final message = _gestureMessages[action];
+    if (model != null && message != null) {
+      _performGestureAction(model, message);
+    }
+  }
+
+  // ── 전면 카메라 ─────────────────────────────────────────────────────────────
+
   Future<void> _initFrontCamera() async {
     if (cameras.isEmpty) return;
-    final frontCamera = cameras.firstWhere(
+    final front = cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.front,
       orElse: () => cameras.first,
     );
-
-    _frontCameraController = CameraController(
-      frontCamera,
-      ResolutionPreset.low,
-      enableAudio: false,
-    );
-
+    _frontCameraController = CameraController(front, ResolutionPreset.low, enableAudio: false);
     try {
       await _frontCameraController!.initialize();
       if (!mounted) return;
-      _frontCameraController!.startImageStream(_processCameraImage);
+      // 0.8초마다 사진 캡처 → 서버 전송
+      _captureTimer = Timer.periodic(
+        const Duration(milliseconds: 800),
+        (_) => _captureAndSend(),
+      );
     } catch (e) {
       debugPrint("Front camera error: $e");
     }
   }
 
-  Future<void> _processCameraImage(CameraImage image) async {
-    if (_isBusy || _isActionExecuting || !_isCharacterPlaced) return;
-    _isBusy = true;
-
-    final inputImage = _inputImageFromCameraImage(image);
-    if (inputImage == null) {
-      _isBusy = false;
-      return;
-    }
-
+  Future<void> _captureAndSend() async {
+    if (!_isCharacterPlaced) return;
+    if (_wsChannel == null) return;
+    if (_frontCameraController == null || !_frontCameraController!.value.isInitialized) return;
     try {
-      final poses = await _poseDetector.processImage(inputImage);
-      if (poses.isNotEmpty) {
-        final pose = poses.first;
-        final leftWrist = pose.landmarks[PoseLandmarkType.leftWrist];
-        final rightWrist = pose.landmarks[PoseLandmarkType.rightWrist];
-
-        if ((leftWrist != null && leftWrist.likelihood > 0.8) || 
-            (rightWrist != null && rightWrist.likelihood > 0.8)) {
-          _performWaveAction();
-        }
-      }
-    } catch (e) {
-      debugPrint("Pose detection error: $e");
-    } finally {
-      _isBusy = false;
+      final file  = await _frontCameraController!.takePicture();
+      final bytes = await file.readAsBytes();
+      _wsChannel!.sink.add(jsonEncode({
+        'action': 'FRAME',
+        'frame': base64Encode(bytes),
+      }));
+    } catch (_) {
+      // AR 세션과 카메라 충돌 등 일시적 오류는 무시
     }
   }
 
-  // 모델 교체 시 모든 파라미터를 명시적으로 고정
-  Future<void> _updateCharacterModel(String modelPath, {required vector.Vector3 position, required double yaw}) async {
-    // 이미 같은 모델이 표시 중이라면 위치와 회전만 업데이트하여 깜빡임 방지
+  // ── AR 캐릭터 제어 ──────────────────────────────────────────────────────────
+
+  Future<void> _updateCharacterModel(
+    String modelPath, {
+    required vector.Vector3 position,
+    required double yaw,
+  }) async {
     if (_characterNode != null && _characterNode!.uri == modelPath) {
-      _characterNode!.position = position;
+      _characterNode!.position    = position;
       _characterNode!.eulerAngles = vector.Vector3(0, yaw, 0);
       return;
     }
-
-    // 1. 이전 노드 제거
     if (_characterNode != null) {
       await arObjectManager?.removeNode(_characterNode!);
     }
-
-    // 2. 새 노드 생성 및 크기/위치/방향(Yaw) 강제 고정
     _characterNode = ARNode(
       type: NodeType.localGLTF2,
       uri: modelPath,
       scale: _fixedScale,
       position: position,
     );
-    // X, Z축 회전을 0으로 고정하여 뒤집힘 원천 차단
     _characterNode!.eulerAngles = vector.Vector3(0, yaw, 0);
-
-    // 3. 새 노드 추가
     await arObjectManager?.addNode(_characterNode!, planeAnchor: _currentAnchor);
   }
 
-  Future<void> _performWaveAction() async {
+  Future<void> _performGestureAction(String modelPath, String message) async {
     if (_isActionExecuting || _characterNode == null) return;
     _isActionExecuting = true;
     _wanderTimer?.cancel();
+    if (mounted) setState(() => _statusMessage = message);
 
-    if (mounted) setState(() { _statusMessage = "안녕! 다마고치가 손을 흔듭니다."; });
+    final pos = _characterNode!.position;
+    final yaw = _characterNode!.eulerAngles.y;
 
-    final lastPos = _characterNode!.position;
-    final lastYaw = _characterNode!.eulerAngles.y;
-
-    await _updateCharacterModel("assets/models/TAMA1_Big_Wave_Hello.glb", position: lastPos, yaw: lastYaw);
+    await _updateCharacterModel(modelPath, position: pos, yaw: yaw);
     await Future.delayed(const Duration(seconds: 4));
 
     if (mounted) {
-      await _updateCharacterModel("assets/models/TAMA1_Casual_Walk.glb", position: lastPos, yaw: lastYaw);
-      setState(() { _statusMessage = "다마고치와 함께 놀아요!"; });
+      await _updateCharacterModel(
+        'assets/models/TAMA1_Casual_Walk.glb', position: pos, yaw: yaw,
+      );
+      setState(() => _statusMessage = '다마고치와 함께 놀아요!');
       _isActionExecuting = false;
       _startWandering();
     }
   }
 
-  InputImage? _inputImageFromCameraImage(CameraImage image) {
-    final sensorOrientation = cameras.firstWhere((c) => c.lensDirection == CameraLensDirection.front).sensorOrientation;
-    final rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
-    if (rotation == null) return null;
-
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
-
-    final allBytes = WriteBuffer();
-    for (final plane in image.planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-    final bytes = allBytes.done().buffer.asUint8List();
-
-    final imageSize = Size(image.width.toDouble(), image.height.toDouble());
-    final metadata = InputImageMetadata(
-      size: imageSize,
-      rotation: rotation,
-      format: format,
-      bytesPerRow: image.planes[0].bytesPerRow,
-    );
-
-    return InputImage.fromBytes(bytes: bytes, metadata: metadata);
-  }
+  // ── AR 세션 ─────────────────────────────────────────────────────────────────
 
   void onARViewCreated(
     ARSessionManager arSessionManager,
@@ -193,8 +215,8 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
     ARLocationManager arLocationManager,
   ) {
     this.arSessionManager = arSessionManager;
-    this.arObjectManager = arObjectManager;
-    this.arAnchorManager = arAnchorManager;
+    this.arObjectManager  = arObjectManager;
+    this.arAnchorManager  = arAnchorManager;
 
     this.arSessionManager!.onInitialize(
       showFeaturePoints: true,
@@ -205,70 +227,81 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
     this.arObjectManager!.onInitialize();
 
     this.arSessionManager!.onPlaneOrPointTap = (List<ARHitTestResult> hits) {
-      if (_isCharacterPlaced) return;
-
-      if (hits.isNotEmpty) {
-        // 1. 가장 좋은 히트 결과 찾기 (평면 우선, 없으면 첫 번째 결과)
-        ARHitTestResult bestHit = hits.firstWhere(
-          (hit) => hit.type == ARHitTestResultType.plane,
-          orElse: () => hits.first,
-        );
-        _addAnchorAndNode(bestHit);
-      } else {
-        // 히트 결과가 없는 경우 사용자에게 알림
-        if (mounted) {
-          setState(() {
-            _statusMessage = "바닥 인식이 더 필요합니다. 카메라를 조금 움직여주세요.";
-          });
-        }
+      if (_isCharacterPlaced || _isPlacing) return;
+      final planeHits = hits.where((h) => h.type == ARHitTestResultType.plane).toList();
+      if (planeHits.isEmpty) {
+        if (mounted) setState(() => _statusMessage = "평면이 인식되지 않았습니다. 바닥을 향해 천천히 원을 그리듯 움직여주세요.");
+        return;
       }
+      if (mounted) setState(() => _statusMessage = "다마고치 소환 중...");
+      _addAnchorAndNode(planeHits.first);
     };
 
     this.arSessionManager!.onPlaneDetected = (int planeCount) {
-      if (!_isCharacterPlaced && planeCount > 0) {
-        if (mounted) {
-          setState(() {
-            _statusMessage = "바닥을 찾았습니다! 원하는 곳을 터치하세요.";
-          });
-        }
+      if (!_isCharacterPlaced && mounted) {
+        setState(() {
+          _statusMessage = planeCount > 0
+              ? "평면 인식 완료! ($planeCount개 구역) 원하는 곳을 터치하세요."
+              : "바닥 스캔 중... 휴대폰을 좌우로 천천히 움직이세요.";
+        });
       }
     };
   }
 
   Future<void> _addAnchorAndNode(ARHitTestResult hitResult) async {
-    if (_isCharacterPlaced) return;
-    _isCharacterPlaced = true;
-    
-    // hitResult.type에 상관없이 최대한 앵커 생성을 시도하여 빠른 소환 지원
-    _currentAnchor = ARPlaneAnchor(transformation: hitResult.worldTransform);
-    bool? didAddAnchor = await arAnchorManager?.addAnchor(_currentAnchor!);
-    
-    if (didAddAnchor == true) {
-      _characterNode = ARNode(
-        type: NodeType.localGLTF2,
-        uri: "assets/models/TAMA1_stop.glb",
-        scale: _fixedScale,
-        position: vector.Vector3(0, 0, 0),
-      );
-      _characterNode!.eulerAngles = vector.Vector3(0, 0, 0);
+    if (_isCharacterPlaced || _isPlacing) return;
+    _isPlacing = true;
 
-      bool? didAddNode = await arObjectManager?.addNode(_characterNode!, planeAnchor: _currentAnchor);
-      
-      if (didAddNode == true) {
-        if (mounted) {
-          setState(() {
-            _statusMessage = "다마고치가 소환되었습니다!";
-          });
-        }
-        _startWandering();
-      }
-    } else {
-      _isCharacterPlaced = false;
-      if (mounted) {
-        setState(() {
-          _statusMessage = "소환 실패. 다른 곳을 터치해보세요.";
-        });
-      }
+    _currentAnchor = ARPlaneAnchor(transformation: hitResult.worldTransform);
+    final didAddAnchor = await arAnchorManager?.addAnchor(_currentAnchor!);
+    if (didAddAnchor != true) {
+      _isPlacing = false;
+      _currentAnchor = null;
+      if (mounted) setState(() => _statusMessage = "앵커 생성 실패. 평면 위 다른 곳을 터치해보세요.");
+      return;
+    }
+
+    _characterNode = ARNode(
+      type: NodeType.localGLTF2,
+      uri: 'assets/models/TAMA1_stop.glb',
+      scale: _fixedScale,
+      position: vector.Vector3(0, 0, 0),
+    );
+    _characterNode!.eulerAngles = vector.Vector3(0, 0, 0);
+
+    final didAddNode = await arObjectManager?.addNode(_characterNode!, planeAnchor: _currentAnchor);
+    if (didAddNode != true) {
+      await arAnchorManager?.removeAnchor(_currentAnchor!);
+      _characterNode = null;
+      _currentAnchor = null;
+      _isPlacing = false;
+      if (mounted) setState(() => _statusMessage = "캐릭터 소환 실패. 다시 터치해보세요.");
+      return;
+    }
+
+    _isCharacterPlaced = true;
+    _isPlacing = false;
+    if (mounted) setState(() => _statusMessage = "소환 완료! 손 제스처로 다마고치와 놀아보세요.");
+    _startWandering();
+  }
+
+  Future<void> _resetPlacement() async {
+    _wanderTimer?.cancel();
+    _isActionExecuting = false;
+    _isPlacing = false;
+    if (_characterNode != null) {
+      await arObjectManager?.removeNode(_characterNode!);
+      _characterNode = null;
+    }
+    if (_currentAnchor != null) {
+      await arAnchorManager?.removeAnchor(_currentAnchor!);
+      _currentAnchor = null;
+    }
+    if (mounted) {
+      setState(() {
+        _isCharacterPlaced = false;
+        _statusMessage = "바닥을 향해 카메라를 천천히 움직여 평면을 인식시키세요.";
+      });
     }
   }
 
@@ -276,42 +309,39 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
     if (_isActionExecuting) return;
     _wanderTimer = Timer.periodic(const Duration(seconds: 12), (timer) async {
       if (!mounted || _isActionExecuting || _characterNode == null) return;
-      
       _isActionExecuting = true;
-      
+
       final startPos = vector.Vector3.copy(_characterNode!.position);
-      final random = math.Random();
-      final double targetX = (random.nextDouble() - 0.5) * 0.4;
-      final double targetZ = (random.nextDouble() - 0.5) * 0.4;
-      
-      final angle = math.atan2(targetX - startPos.x, targetZ - startPos.z);
+      final rng = math.Random();
+      final targetX = (rng.nextDouble() - 0.5) * 0.4;
+      final targetZ = (rng.nextDouble() - 0.5) * 0.4;
+      final angle   = math.atan2(targetX - startPos.x, targetZ - startPos.z);
 
-      // 1. 걷기 모델로 변경 (회전 고정 포함)
-      await _updateCharacterModel("assets/models/TAMA1_Casual_Walk.glb", position: startPos, yaw: angle);
+      await _updateCharacterModel(
+        'assets/models/TAMA1_Casual_Walk.glb', position: startPos, yaw: angle,
+      );
 
-      // 2. 실제 위치 이동 (루프)
-      int steps = 60;
-      double stepX = (targetX - startPos.x) / steps;
-      double stepZ = (targetZ - startPos.z) / steps;
-
+      const steps = 60;
+      final stepX = (targetX - startPos.x) / steps;
+      final stepZ = (targetZ - startPos.z) / steps;
       for (int i = 0; i < steps; i++) {
         await Future.delayed(const Duration(milliseconds: 50));
         if (!mounted || !_isActionExecuting || _characterNode == null) break;
-        
-        final currentPos = _characterNode!.position;
-        currentPos.x += stepX;
-        currentPos.z += stepZ;
-        _characterNode!.position = currentPos;
+        final pos = _characterNode!.position;
+        pos.x += stepX;
+        pos.z += stepZ;
+        _characterNode!.position = pos;
       }
 
-      // 3. 도착 후 정지 모델로 복구 (현재 위치와 각도 유지)
       if (mounted && _isActionExecuting && _characterNode != null) {
         final finalPos = vector.Vector3.copy(_characterNode!.position);
-        await _updateCharacterModel("assets/models/TAMA1_stop.glb", position: finalPos, yaw: angle);
+        await _updateCharacterModel('assets/models/TAMA1_stop.glb', position: finalPos, yaw: angle);
         _isActionExecuting = false;
       }
     });
   }
+
+  // ── UI ──────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -322,45 +352,74 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
             onARViewCreated: onARViewCreated,
             planeDetectionConfig: PlaneDetectionConfig.horizontal,
           ),
-          if (_frontCameraController != null && _frontCameraController!.value.isInitialized)
-             const SizedBox.shrink(),
+
+          // 상단 바 (뒤로가기 + 상태 메시지 + 재소환 버튼)
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.all(16.0),
+              padding: const EdgeInsets.all(16),
               child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   IconButton(
                     icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white),
                     onPressed: () => Navigator.pop(context),
                   ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      _statusMessage,
-                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                  Expanded(
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          _statusMessage,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                        ),
+                      ),
                     ),
                   ),
+                  if (_isCharacterPlaced)
+                    IconButton(
+                      icon: const Icon(Icons.refresh_rounded, color: Colors.white),
+                      tooltip: "다시 소환",
+                      onPressed: _resetPlacement,
+                    )
+                  else
+                    const SizedBox(width: 48),
                 ],
               ),
             ),
           ),
-          if (!_isCharacterPlaced)
+
+          // 표정 인식 결과
+          if (_expressionEmoji != null)
             Positioned(
+              top: 100,
+              right: 20,
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(_expressionEmoji!, style: const TextStyle(fontSize: 36)),
+              ),
+            ),
+
+          // 평면 스캔 안내
+          if (!_isCharacterPlaced && !_isPlacing)
+            const Positioned(
               bottom: 60,
               left: 0,
               right: 0,
               child: Center(
                 child: Column(
                   children: [
-                    const CircularProgressIndicator(color: Colors.white),
-                    const SizedBox(height: 16),
-                    const Text(
-                      "캐릭터를 소환할 위치를 터치하세요!\n(바닥을 비추며 터치하면 더 정확합니다)",
+                    CircularProgressIndicator(color: Colors.white),
+                    SizedBox(height: 16),
+                    Text(
+                      "평면(노란 격자)이 나타나면 터치하세요!\n밝은 곳에서 바닥을 향해 카메라를 천천히 움직이면 더 잘 인식됩니다.",
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         color: Colors.white,
@@ -370,6 +429,33 @@ class _ARCameraScreenState extends State<ARCameraScreen> {
                       ),
                     ),
                   ],
+                ),
+              ),
+            ),
+
+          if (_isPlacing)
+            const Positioned(
+              bottom: 60, left: 0, right: 0,
+              child: Center(child: CircularProgressIndicator(color: Colors.white)),
+            ),
+
+          // 소환 후 제스처 가이드
+          if (_isCharacterPlaced)
+            Positioned(
+              bottom: 32,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Text(
+                    "✋ 인사    ✌️ 기쁨    👊 파이팅    🤞 사랑",
+                    style: TextStyle(color: Colors.white, fontSize: 14, letterSpacing: 1),
+                  ),
                 ),
               ),
             ),

@@ -6,6 +6,7 @@ import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:camera/camera.dart';
 import 'camera_screen.dart';
+import 'database_helper.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -43,7 +44,6 @@ class TamagotchiMain extends StatefulWidget {
 }
 
 class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStateMixin {
-  // 상태 변수
   int level = 1;
   int diamonds = 0;
   int gold = 0;
@@ -52,15 +52,13 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   int hygiene = 100;
   int energy = 70;
 
-  List<_FallingApple> _apples = [];
-  List<_TapFeedback> _tapFeedbacks = [];
+  final List<_FallingApple> _apples = [];
+  final List<_TapFeedback> _tapFeedbacks = [];
   final math.Random _random = math.Random();
 
-  // AI 및 위치 변수
   double _charX = 0.0;
   double _charZ = -30.0;
-  double _charYaw = 0;
-  int _currentModelIndex = 0; // 0: stop, 1: walk, 2: hello
+  int _currentModelIndex = 0;
   Timer? _mainWanderTimer;
   
   int _rubCount = 0;
@@ -76,25 +74,50 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
       : 'assets/backs/back_in.png';
 
   final WebSocketChannel channel = WebSocketChannel.connect(
-    Uri.parse('ws://192.168.200.193:8000/ws/gesture'),
+    Uri.parse('wss://unsmooth-nacho-glancing.ngrok-free.dev/ws/gesture'),
   );
 
   @override
   void initState() {
     super.initState();
+    _loadInitialData();
     _startMainWandering();
 
     channel.stream.listen(
       (data) {
+        debugPrint("서버 데이터 수신: $data");
         final decoded = jsonDecode(data);
-        setState(() {
-          if (decoded['current_fullness'] != null) fullness = decoded['current_fullness'];
-          if (decoded['gold'] != null) gold = decoded['gold'];
-          if (decoded['diamonds'] != null) diamonds = decoded['diamonds'];
-        });
+        if (mounted) {
+          setState(() {
+            if (decoded['current_fullness'] != null) fullness = decoded['current_fullness'];
+            if (decoded['gold'] != null) gold = decoded['gold'];
+            if (decoded['diamonds'] != null) diamonds = decoded['diamonds'];
+            if (decoded['level'] != null) level = decoded['level'];
+            if (decoded['mood'] != null) mood = decoded['mood'];
+            if (decoded['hygiene'] != null) hygiene = decoded['hygiene'];
+            if (decoded['energy'] != null) energy = decoded['energy'];
+          });
+          DatabaseHelper().updateTamagotchi(decoded);
+        }
       },
       onError: (error) => debugPrint("WebSocket Error: $error"),
+      onDone: () => debugPrint("WebSocket 연결 종료"),
     );
+  }
+
+  Future<void> _loadInitialData() async {
+    final data = await DatabaseHelper().getTamagotchi();
+    if (data != null && mounted) {
+      setState(() {
+        level = data['level'] ?? level;
+        gold = data['gold'] ?? gold;
+        diamonds = data['diamonds'] ?? diamonds;
+        mood = data['mood'] ?? mood;
+        fullness = data['fullness'] ?? fullness;
+        hygiene = data['hygiene'] ?? hygiene;
+        energy = data['energy'] ?? energy;
+      });
+    }
   }
 
   void _spawnApple() {
@@ -112,14 +135,12 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   void _onAppleTapped(int id, double x, double y) {
     setState(() {
       _apples.removeWhere((apple) => apple.id == id);
-      // 사과 터치 위치에 사과 이모티콘 피드백 추가
       _tapFeedbacks.add(_TapFeedback(
         id: DateTime.now().millisecondsSinceEpoch,
         x: x,
         y: y,
       ));
       
-      // 캐릭터 머리 위 음표 피드백 활성화
       _isEatingAction = true;
       _eatingActionTimer?.cancel();
       _eatingActionTimer = Timer(const Duration(milliseconds: 1500), () {
@@ -130,7 +151,6 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     });
   }
 
-  // 메인 배회 AI
   void _startMainWandering() {
     _mainWanderTimer = Timer.periodic(const Duration(seconds: 12), (timer) async {
       if (!mounted || _isHappyAction) return;
@@ -142,21 +162,19 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
         double dx = targetX - _charX;
         double dz = targetZ - _charZ;
         
-        double newYaw;
+        int nextIndex;
         if (dz.abs() > dx.abs()) {
-          newYaw = (dz > 0) ? 180 : 0; 
+          nextIndex = (dz > 0) ? 2 : 1; // 2: Back (180), 1: Front (0)
         } else {
-          newYaw = (dx > 0) ? -90 : 90; 
+          nextIndex = (dx > 0) ? 4 : 3; // 4: Right (-90), 3: Left (90)
         }
 
         if (mounted) {
           setState(() {
-            _currentModelIndex = 1; // 걷기 시작
-            _charYaw = newYaw;
+            _currentModelIndex = nextIndex;
           });
         }
 
-        // 방향 전환 시간 대기
         await Future.delayed(const Duration(milliseconds: 500));
         
         if (mounted && !_isHappyAction) {
@@ -166,14 +184,10 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
           });
         }
 
-        // 이동 지속 시간 (3.7초)
         await Future.delayed(const Duration(milliseconds: 3700));
         
         if (mounted && !_isHappyAction) {
-          setState(() {
-            _currentModelIndex = 0; // 정지
-            _charYaw = 0; // 정지 시 정면
-          });
+          setState(() => _currentModelIndex = 0);
         }
       }
     });
@@ -191,8 +205,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   Future<void> _performHappyAction() async {
     setState(() {
       _isHappyAction = true;
-      _currentModelIndex = 2; // Wave_One_Hand 인사
-      _charYaw = 0;
+      _currentModelIndex = 5;
       mood = (mood + 10).clamp(0, 100);
     });
 
@@ -201,7 +214,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     if (mounted) {
       setState(() {
         _isHappyAction = false;
-        _currentModelIndex = 0; // 다시 정지
+        _currentModelIndex = 0; 
       });
     }
   }
@@ -235,27 +248,25 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
                 children: [
                   _buildTopBar(),
                   Expanded(
-                    child: Center(
-                      child: Container(
-                        width: double.infinity,
-                        height: 450,
-                        child: Stack(
-                          alignment: Alignment.center,
-                          children: [
-                            AnimatedPositioned(
-                              duration: const Duration(milliseconds: 3700),
-                              curve: Curves.easeInOut,
-                              left: screenWidth / 2 - 300 + _charX,
-                              bottom: 40 + _charZ,
-                              child: Transform.scale(
-                                scale: 0.5 * (1.0 - (_charZ / 500)),
-                                child: Container(
-                                  width: 600,
-                                  height: 600,
-                                  child: Stack(
+                    child: SizedBox(
+                      width: double.infinity,
+                      height: 450,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          AnimatedPositioned(
+                            duration: const Duration(milliseconds: 3700),
+                            curve: Curves.easeInOut,
+                            left: screenWidth / 2 - 300 + _charX,
+                            bottom: 40 + _charZ,
+                            child: Transform.scale(
+                              scale: 0.5 * (1.0 - (_charZ / 500)),
+                              child: SizedBox(
+                                width: 600,
+                                height: 600,
+                                child: Stack(
                                     alignment: Alignment.center,
                                     children: [
-                                      // 바닥 그림자
                                       Positioned(
                                         bottom: 165,
                                         child: Container(
@@ -267,16 +278,17 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
                                           ),
                                         ),
                                       ),
-                                      // 3D 캐릭터 레이어
                                       IndexedStack(
                                         index: _currentModelIndex,
                                         children: [
                                           _buildModelViewer('assets/models/TAMA1_stop.glb', 0, "stop"),
-                                          _buildModelViewer('assets/models/TAMA1_Casual_Walk.glb', _charYaw, "walk"),
+                                          _buildModelViewer('assets/models/TAMA1_Casual_Walk.glb', 0, "walk_f"),
+                                          _buildModelViewer('assets/models/TAMA1_Casual_Walk.glb', 180, "walk_b"),
+                                          _buildModelViewer('assets/models/TAMA1_Casual_Walk.glb', 90, "walk_l"),
+                                          _buildModelViewer('assets/models/TAMA1_Casual_Walk.glb', -90, "walk_r"),
                                           _buildModelViewer('assets/models/TAMA1_Wave_One_Hand.glb', 0, "hello"),
                                         ],
                                       ),
-                                      // 쓰다듬기 하트 이모티콘
                                       if (_isHappyAction)
                                         Positioned(
                                           top: 10,
@@ -294,7 +306,6 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
                                             },
                                           ),
                                         ),
-                                      // 식사 음표 이모티콘
                                       if (_isEatingAction)
                                         Positioned(
                                           top: 10,
@@ -313,7 +324,6 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
                                             },
                                           ),
                                         ),
-                                      // 인터랙션용 투명 오버레이
                                       GestureDetector(
                                         onPanUpdate: _onRubUpdate,
                                         behavior: HitTestBehavior.opaque,
@@ -332,18 +342,15 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
                         ),
                       ),
                     ),
-                  ),
                   _buildBottomMenu(),
                 ],
               ),
-              // 떨어지는 사과들
               ..._apples.map((apple) => _FallingAppleWidget(
                 key: ValueKey(apple.id),
                 apple: apple,
                 onTapped: (x, y) => _onAppleTapped(apple.id, x, y),
                 onFinished: () => setState(() => _apples.removeWhere((a) => a.id == apple.id)),
               )),
-              // 사과 터치 피드백 (🍎)
               ..._tapFeedbacks.map((feedback) => _TapFeedbackWidget(
                 key: ValueKey(feedback.id),
                 feedback: feedback,
@@ -358,7 +365,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
 
   Widget _buildModelViewer(String src, double yaw, String stateKey) {
     return ModelViewer(
-      key: ValueKey("$src-$yaw"), 
+      key: ValueKey(stateKey), 
       src: src,
       alt: "다마고치",
       autoRotate: false,
@@ -367,6 +374,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
       cameraControls: false,
       disableZoom: true,
       backgroundColor: Colors.transparent,
+      loading: Loading.eager,
       exposure: 0.5,
       shadowIntensity: 0,
       environmentImage: "neutral",
@@ -439,7 +447,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     return Container(
       margin: const EdgeInsets.fromLTRB(20, 0, 20, 24),
       padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(24), boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 20, offset: const Offset(0, 8))]),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(24), boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 20, offset: Offset(0, 8))]),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: [
@@ -589,7 +597,7 @@ class _TapFeedbackWidgetState extends State<_TapFeedbackWidget> with SingleTicke
           top: widget.feedback.y + _moveUp.value,
           child: Opacity(
             opacity: _opacity.value,
-            child: const Text("🍎", style: TextStyle(fontSize: 30)),
+            child: const Text("+5", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.green)),
           ),
         );
       },
