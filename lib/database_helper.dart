@@ -20,12 +20,13 @@ class DatabaseHelper {
     String path = join(await getDatabasesPath(), 'tamagotchi.db');
     return await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE tamagochis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             level INTEGER,
+            exp INTEGER DEFAULT 0,
             gold INTEGER,
             diamonds INTEGER,
             mood INTEGER,
@@ -35,9 +36,9 @@ class DatabaseHelper {
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           )
         ''');
-        // 초기 데이터 삽입
         await db.insert('tamagochis', {
           'level': 1,
+          'exp': 0,
           'gold': 0,
           'diamonds': 0,
           'mood': 80,
@@ -45,6 +46,13 @@ class DatabaseHelper {
           'hygiene': 100,
           'energy': 70,
         });
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(
+            'ALTER TABLE tamagochis ADD COLUMN exp INTEGER DEFAULT 0',
+          );
+        }
       },
     );
   }
@@ -60,6 +68,7 @@ class DatabaseHelper {
     final db = await database;
     final updateData = {
       if (data['level'] != null) 'level': data['level'],
+      if (data['exp'] != null) 'exp': data['exp'],
       if (data['gold'] != null) 'gold': data['gold'],
       if (data['diamonds'] != null) 'diamonds': data['diamonds'],
       if (data['mood'] != null) 'mood': data['mood'],
