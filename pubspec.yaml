@@ -21,6 +21,7 @@ dependencies:
   vector_math: ^2.1.4
   sqflite: ^2.3.0
   path: ^1.9.0
+  speech_to_text: ^7.0.0
 
 dev_dependencies:
   flutter_test:

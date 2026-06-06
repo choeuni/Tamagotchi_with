@@ -22,7 +22,7 @@ import 'main.dart';
 // 서버 주소 — ngrok 사용 시 아래 URL을 교체하세요
 // 실기기 테스트: ws://<컴퓨터 IP>:8000/ws/gesture
 // 에뮬레이터:   ws://10.0.2.2:8000/ws/gesture
-const _kWsUrl = 'ws://10.0.2.2:8000/ws/gesture';
+const _kWsUrl = 'ws://192.168.200.193:8000/ws/gesture';
 
 class ARCameraScreen extends StatefulWidget {
   const ARCameraScreen({super.key});

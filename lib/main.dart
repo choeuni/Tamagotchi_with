@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:camera/camera.dart';
+import 'package:speech_to_text/speech_to_text.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
 import 'camera_screen.dart';
 import 'database_helper.dart';
 
@@ -54,6 +56,8 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   int energy = 70;
 
   bool _isEvolving = false;
+  bool _isSleeping = false;
+  Timer? _sleepTimer;
 
   final List<_FallingApple> _apples = [];
   final List<_TapFeedback> _tapFeedbacks = [];
@@ -68,6 +72,11 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   bool _isHappyAction = false;
   bool _isEatingAction = false;
   Timer? _eatingActionTimer;
+
+  final SpeechToText _speech = SpeechToText();
+  bool _speechEnabled = false;
+  bool _isListening = false;
+  String _voiceStatus = '';
 
   final Color primaryColor = const Color(0xFF87CEEB);
   bool isOutdoor = false;
@@ -85,19 +94,8 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   static const _stageNames = ['유아기', '청소년기', '성인기'];
   String get _stageName => _stageNames[_evolutionStage];
 
-  int get _levelForNextStage {
-    if (level < 5) return 5;
-    if (level < 10) return 10;
-    return level;
-  }
-
-  String get _nextStageName {
-    if (_evolutionStage < 2) return _stageNames[_evolutionStage + 1];
-    return '성인기';
-  }
-
   final WebSocketChannel channel = WebSocketChannel.connect(
-    Uri.parse('wss://unsmooth-nacho-glancing.ngrok-free.dev/ws/gesture'),
+    Uri.parse('ws://192.168.200.193:8000/ws/gesture'),
   );
 
   @override
@@ -105,6 +103,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     super.initState();
     _loadInitialData();
     _startMainWandering();
+    _initSpeech();
 
     channel.stream.listen(
       (data) {
@@ -115,10 +114,10 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
             if (decoded['current_fullness'] != null) fullness = decoded['current_fullness'];
             if (decoded['gold'] != null) gold = decoded['gold'];
             if (decoded['diamonds'] != null) diamonds = decoded['diamonds'];
-            if (decoded['level'] != null) level = decoded['level'];
+            // level은 로컬 EXP 시스템이 관리 — 서버 값으로 덮어쓰지 않음
             if (decoded['mood'] != null) mood = decoded['mood'];
             if (decoded['hygiene'] != null) hygiene = decoded['hygiene'];
-            if (decoded['energy'] != null) energy = decoded['energy'];
+            if (!_isSleeping && decoded['energy'] != null) energy = decoded['energy'];
           });
           DatabaseHelper().updateTamagotchi(decoded);
         }
@@ -131,21 +130,41 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   Future<void> _loadInitialData() async {
     final data = await DatabaseHelper().getTamagotchi();
     if (data != null && mounted) {
+      int loadedMood     = data['mood']     ?? mood;
+      int loadedFullness = data['fullness'] ?? fullness;
+      int loadedHygiene  = data['hygiene']  ?? hygiene;
+      int loadedEnergy   = data['energy']   ?? energy;
+
+      // 오프라인 경과 시간만큼 스탯 자연 감소 (최대 120분 적용)
+      final lastStr = data['last_updated']?.toString();
+      if (lastStr != null) {
+        final lastUpdated = DateTime.tryParse(lastStr);
+        if (lastUpdated != null) {
+          final mins = DateTime.now().difference(lastUpdated).inMinutes.clamp(0, 120);
+          loadedFullness = (loadedFullness - mins * 2).clamp(0, 100);
+          loadedEnergy   = (loadedEnergy   - mins).clamp(0, 100);
+          loadedMood     = (loadedMood     - mins ~/ 2).clamp(0, 100);
+          loadedHygiene  = (loadedHygiene  - mins ~/ 3).clamp(0, 100);
+        }
+      }
+
       setState(() {
-        level = data['level'] ?? level;
-        exp = data['exp'] ?? exp;
-        gold = data['gold'] ?? gold;
+        level    = data['level']    ?? level;
+        exp      = data['exp']      ?? exp;
+        gold     = data['gold']     ?? gold;
         diamonds = data['diamonds'] ?? diamonds;
-        mood = data['mood'] ?? mood;
-        fullness = data['fullness'] ?? fullness;
-        hygiene = data['hygiene'] ?? hygiene;
-        energy = data['energy'] ?? energy;
+        mood     = loadedMood;
+        fullness = loadedFullness;
+        hygiene  = loadedHygiene;
+        energy   = loadedEnergy;
       });
+      _saveProgress();
     }
   }
 
   void _gainExp(int amount) {
     final stageBefore = _evolutionStage;
+    final levelBefore = level;
 
     setState(() {
       exp += amount;
@@ -156,6 +175,10 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     });
 
     _saveProgress();
+
+    if (level != levelBefore) {
+      channel.sink.add(jsonEncode({'action': 'UPDATE_STATE', 'level': level}));
+    }
 
     if (mounted && _evolutionStage > stageBefore) {
       _triggerEvolution();
@@ -175,6 +198,55 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     });
   }
 
+  void _openShop() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _ShopModal(gold: gold, onBuy: _buyItem),
+    );
+  }
+
+  void _buyItem(Map<String, dynamic> item) {
+    setState(() {
+      gold -= item['price'] as int;
+      if (item['fullness'] != null) fullness = (fullness + (item['fullness'] as int)).clamp(0, 100);
+      if (item['mood']     != null) mood     = (mood     + (item['mood']     as int)).clamp(0, 100);
+      if (item['hygiene']  != null) hygiene  = (hygiene  + (item['hygiene']  as int)).clamp(0, 100);
+      if (item['energy']   != null) energy   = (energy   + (item['energy']   as int)).clamp(0, 100);
+    });
+    channel.sink.add(jsonEncode({
+      'action': 'UPDATE_STATE',
+      'gold': gold,
+      'mood': mood,
+      'fullness': fullness,
+      'hygiene': hygiene,
+      'energy': energy,
+    }));
+    _saveProgress();
+  }
+
+  void _toggleSleep() {
+    if (_isSleeping) {
+      _wakeUp();
+    } else {
+      setState(() => _isSleeping = true);
+      _sleepTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+        if (!mounted || !_isSleeping) { timer.cancel(); return; }
+        setState(() => energy = (energy + 5).clamp(0, 100));
+        if (energy >= 100) { timer.cancel(); _wakeUp(); }
+      });
+    }
+  }
+
+  void _wakeUp() {
+    _sleepTimer?.cancel();
+    if (!mounted) return;
+    setState(() => _isSleeping = false);
+    channel.sink.add(jsonEncode({'action': 'UPDATE_STATE', 'energy': energy}));
+    _saveProgress();
+  }
+
   Future<void> _triggerEvolution() async {
     setState(() => _isEvolving = true);
     await Future.delayed(const Duration(milliseconds: 3500));
@@ -182,6 +254,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   }
 
   void _spawnApple() {
+    // FEED는 사과를 잡았을 때만 전송 — 버튼 누를 때는 사과 생성만
     setState(() {
       _apples.add(_FallingApple(
         id: DateTime.now().millisecondsSinceEpoch,
@@ -189,8 +262,6 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
         y: -50,
       ));
     });
-    final message = jsonEncode({"action": "FEED"});
-    channel.sink.add(message);
   }
 
   void _onAppleTapped(int id, double x, double y) {
@@ -207,15 +278,15 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
       _eatingActionTimer = Timer(const Duration(milliseconds: 1500), () {
         if (mounted) setState(() => _isEatingAction = false);
       });
-
-      fullness = (fullness + 5).clamp(0, 100);
     });
+    // 사과 잡을 때 FEED 전송 — 서버가 fullness/mood/gold 계산 후 브로드캐스트
+    channel.sink.add(jsonEncode({"action": "FEED"}));
     _gainExp(10);
   }
 
   void _startMainWandering() {
     _mainWanderTimer = Timer.periodic(const Duration(seconds: 12), (timer) async {
-      if (!mounted || _isHappyAction) return;
+      if (!mounted || _isHappyAction || _evolutionStage == 0) return;
 
       if (_random.nextDouble() < 0.6) {
         final double targetX = (_random.nextDouble() - 0.5) * 180;
@@ -281,10 +352,69 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
     }
   }
 
+  Future<void> _initSpeech() async {
+    _speechEnabled = await _speech.initialize(
+      onStatus: (status) {
+        if (status == 'done' || status == 'notListening') {
+          if (mounted) setState(() => _isListening = false);
+        }
+      },
+      onError: (error) {
+        if (mounted) setState(() => _isListening = false);
+      },
+    );
+  }
+
+  Future<void> _toggleListening() async {
+    if (!_speechEnabled) return;
+    if (_isListening) {
+      await _speech.stop();
+      setState(() => _isListening = false);
+      return;
+    }
+    setState(() {
+      _isListening = true;
+      _voiceStatus = '듣고 있어요...';
+    });
+    await _speech.listen(
+      onResult: _onVoiceResult,
+      listenOptions: SpeechListenOptions(
+        localeId: 'ko_KR',
+        listenFor: const Duration(seconds: 6),
+        pauseFor: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _onVoiceResult(SpeechRecognitionResult result) {
+    setState(() => _voiceStatus = result.recognizedWords);
+    if (result.finalResult) {
+      _handleVoiceCommand(result.recognizedWords);
+      Future.delayed(const Duration(seconds: 1), () {
+        if (mounted) setState(() => _voiceStatus = '');
+      });
+    }
+  }
+
+  void _handleVoiceCommand(String text) {
+    final t = text;
+    if (t.contains('밥') || t.contains('먹') || t.contains('배고')) {
+      _spawnApple();
+    } else if (t.contains('놀') || t.contains('칭찬') || t.contains('잘했')) {
+      if (!_isHappyAction) _performHappyAction();
+    } else if (t.contains('자') || t.contains('졸려') || t.contains('잠')) {
+      if (!_isSleeping) _toggleSleep();
+    } else if (t.contains('일어') || t.contains('깨')) {
+      if (_isSleeping) _toggleSleep();
+    }
+  }
+
   @override
   void dispose() {
     _mainWanderTimer?.cancel();
     _eatingActionTimer?.cancel();
+    _sleepTimer?.cancel();
+    _speech.stop();
     channel.sink.close();
     super.dispose();
   }
@@ -314,6 +444,7 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
                       width: double.infinity,
                       height: 450,
                       child: Stack(
+                        clipBehavior: Clip.none,
                         alignment: Alignment.center,
                         children: [
                           AnimatedPositioned(
@@ -353,6 +484,20 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
               if (_isEvolving)
                 Positioned.fill(
                   child: _EvolutionOverlay(stageName: _stageName),
+                ),
+              if (_isSleeping)
+                Positioned.fill(
+                  child: _SleepOverlay(energy: energy, onWake: _wakeUp),
+                ),
+              if (_isListening || _voiceStatus.isNotEmpty)
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: _VoiceStatusBanner(
+                    isListening: _isListening,
+                    statusText: _voiceStatus,
+                  ),
                 ),
             ],
           ),
@@ -473,216 +618,250 @@ class _TamagotchiMainState extends State<TamagotchiMain> with TickerProviderStat
   }
 
   Widget _buildTopBar() {
+    final bool isMaxStage = _evolutionStage >= 2;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 16.0),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
+          // 왼쪽: 레벨 카드 + 상점
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildLevelChip(),
-              const SizedBox(height: 16),
-              _buildIconButton(Icons.storefront_rounded, () {}),
-              const SizedBox(height: 12),
-              _buildIconButton(Icons.camera_alt_rounded, () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const ARCameraScreen()),
-                );
-              }),
-              const SizedBox(height: 12),
-              _buildIconButton(
-                isOutdoor ? Icons.home_rounded : Icons.directions_walk_rounded,
-                () => setState(() => isOutdoor = !isOutdoor),
-              ),
-            ],
-          ),
-          _buildTopChip(Icons.monetization_on_rounded, "$gold", const Color(0xFFF6A000)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildLevelChip() {
-    final bool isMaxStage = _evolutionStage >= 2;
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.04),
-            blurRadius: 10,
-            offset: const Offset(0, 2),
-          )
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.stars_rounded, color: primaryColor, size: 20),
-              const SizedBox(width: 6),
-              Text(
-                'Lv. $level  $_stageName',
-                style: const TextStyle(
-                  fontWeight: FontWeight.w700,
-                  fontSize: 15,
-                  color: Color(0xFF333D4B),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.93),
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.06), blurRadius: 10, offset: const Offset(0, 2))],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.stars_rounded, color: primaryColor, size: 16),
+                    const SizedBox(width: 5),
+                    Text('Lv.$level', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: Color(0xFF333D4B))),
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: primaryColor.withValues(alpha: 0.18),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(_stageName, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: primaryColor)),
+                    ),
+                    if (!isMaxStage) ...[
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        width: 64,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: LinearProgressIndicator(
+                            value: exp / 100.0,
+                            minHeight: 5,
+                            backgroundColor: const Color(0xFFEEF0F3),
+                            valueColor: AlwaysStoppedAnimation<Color>(primaryColor),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Text('$exp', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF8B95A1))),
+                    ],
+                  ],
                 ),
               ),
+              const SizedBox(height: 10),
+              _buildTopIconBtn(Icons.storefront_rounded, _openShop),
             ],
           ),
-          if (!isMaxStage) ...[
-            const SizedBox(height: 6),
-            SizedBox(
-              width: 130,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+          // 오른쪽: 골드 카드 + AR · 음성
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.93),
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.06), blurRadius: 10, offset: const Offset(0, 2))],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.monetization_on_rounded, color: Color(0xFFF6A000), size: 16),
+                    const SizedBox(width: 4),
+                    Text('$gold', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: Color(0xFF333D4B))),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
                 children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(4),
-                    child: LinearProgressIndicator(
-                      value: exp / 100.0,
-                      minHeight: 6,
-                      backgroundColor: const Color(0xFFEEF0F3),
-                      valueColor: AlwaysStoppedAnimation<Color>(primaryColor),
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    '$exp / 100 EXP  →  Lv$_levelForNextStage $_nextStageName',
-                    style: const TextStyle(fontSize: 9, color: Color(0xFF8B95A1)),
+                  _buildTopIconBtn(Icons.camera_alt_rounded, () {
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => const ARCameraScreen()));
+                  }),
+                  const SizedBox(width: 8),
+                  _buildTopIconBtn(
+                    _isListening ? Icons.mic_rounded : Icons.mic_none_rounded,
+                    _toggleListening,
+                    active: _isListening,
                   ),
                 ],
               ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTopChip(IconData icon, String text, Color iconColor) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.04),
-            blurRadius: 10,
-            offset: const Offset(0, 2),
-          )
-        ],
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, color: iconColor, size: 20),
-          const SizedBox(width: 6),
-          Text(
-            text,
-            style: const TextStyle(
-              fontWeight: FontWeight.w700,
-              fontSize: 15,
-              color: Color(0xFF333D4B),
-            ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _buildIconButton(IconData icon, VoidCallback onTap) {
+  Widget _buildTopIconBtn(IconData icon, VoidCallback onTap, {bool active = false}) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.all(10),
-        decoration: const BoxDecoration(
-          color: Colors.white,
+        decoration: BoxDecoration(
+          color: active ? primaryColor.withValues(alpha: 0.15) : Colors.white.withValues(alpha: 0.93),
           shape: BoxShape.circle,
-          boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 8, offset: Offset(0, 2))],
+          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.06), blurRadius: 8, offset: const Offset(0, 2))],
         ),
-        child: Icon(icon, color: const Color(0xFF8B95A1), size: 20),
+        child: Icon(icon, color: active ? primaryColor : const Color(0xFF4E5968), size: 20),
       ),
     );
   }
 
   Widget _buildBottomMenu() {
     return Container(
-      margin: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-      padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
-      decoration: BoxDecoration(
+      decoration: const BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 20, offset: Offset(0, 8))],
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 24, offset: Offset(0, -4))],
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          _buildMenuIcon(Icons.face_rounded, "기분", mood / 100.0, null),
-          _buildMenuIcon(Icons.restaurant_rounded, "식사", fullness / 100.0, _spawnApple),
-          _buildMenuIcon(Icons.wc_rounded, "화장실", hygiene / 100.0, null),
-          _buildMenuIcon(Icons.dark_mode_rounded, "취침", energy / 100.0, null),
+          Container(
+            margin: const EdgeInsets.only(top: 10, bottom: 14),
+            width: 36,
+            height: 3,
+            decoration: BoxDecoration(color: const Color(0xFFDDE1E7), borderRadius: BorderRadius.circular(2)),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(child: _buildStatRow(Icons.favorite_rounded, '기분', mood, const Color(0xFFFF8A80))),
+                    const SizedBox(width: 14),
+                    Expanded(child: _buildStatRow(Icons.restaurant_rounded, '식사', fullness, const Color(0xFF69D2A0))),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(child: _buildStatRow(Icons.water_drop_rounded, '위생', hygiene, const Color(0xFF87CEEB))),
+                    const SizedBox(width: 14),
+                    Expanded(child: _buildStatRow(Icons.bolt_rounded, '에너지', energy, const Color(0xFFFFB74D))),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Divider(height: 1, color: Color(0xFFF0F2F5)),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+            child: Row(
+              children: [
+                Expanded(child: _buildActionBtn(Icons.restaurant_rounded, '밥주기', _spawnApple)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildActionBtn(
+                    _isSleeping ? Icons.wb_sunny_rounded : Icons.dark_mode_rounded,
+                    _isSleeping ? '기상' : '취침',
+                    _toggleSleep,
+                    active: _isSleeping,
+                    activeColor: const Color(0xFF7986CB),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildActionBtn(
+                    isOutdoor ? Icons.home_rounded : Icons.directions_walk_rounded,
+                    isOutdoor ? '실내' : '실외',
+                    () => setState(() => isOutdoor = !isOutdoor),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildMenuIcon(IconData icon, String label, double percentage, VoidCallback? onTap) {
-    final safePercentage = percentage.clamp(0.0, 1.0);
+  Widget _buildStatRow(IconData icon, String label, int value, Color color) {
+    final double pct = (value / 100.0).clamp(0.0, 1.0);
+    final Color barColor = pct > 0.5 ? color : pct > 0.25 ? const Color(0xFFFFB74D) : const Color(0xFFFF5252);
+    return Row(
+      children: [
+        Icon(icon, color: barColor, size: 15),
+        const SizedBox(width: 5),
+        Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF4E5968))),
+        const SizedBox(width: 6),
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: pct,
+              minHeight: 5,
+              backgroundColor: const Color(0xFFF0F2F5),
+              valueColor: AlwaysStoppedAnimation<Color>(barColor),
+            ),
+          ),
+        ),
+        const SizedBox(width: 5),
+        SizedBox(
+          width: 22,
+          child: Text('$value', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Color(0xFF8B95A1)), textAlign: TextAlign.right),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildActionBtn(
+    IconData icon,
+    String label,
+    VoidCallback onTap, {
+    bool active = false,
+    Color activeColor = const Color(0xFF87CEEB),
+  }) {
     return GestureDetector(
       onTap: onTap,
-      behavior: HitTestBehavior.opaque,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(
-            width: 56,
-            height: 56,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(16),
-              child: Stack(
-                children: [
-                  Container(color: const Color(0xFFF2F4F6)),
-                  Align(
-                    alignment: Alignment.bottomCenter,
-                    child: FractionallySizedBox(
-                      heightFactor: safePercentage,
-                      widthFactor: 1.0,
-                      child: Container(color: primaryColor),
-                    ),
-                  ),
-                  Center(
-                    child: Icon(
-                      icon,
-                      color: safePercentage > 0.5 ? Colors.white : const Color(0xFF4E5968),
-                      size: 28,
-                    ),
-                  ),
-                ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          color: active ? activeColor.withValues(alpha: 0.12) : const Color(0xFFF5F7FA),
+          borderRadius: BorderRadius.circular(18),
+          border: active ? Border.all(color: activeColor.withValues(alpha: 0.35), width: 1.5) : null,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: active ? activeColor : const Color(0xFF4E5968), size: 26),
+            const SizedBox(height: 6),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: active ? activeColor : const Color(0xFF4E5968),
               ),
             ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-              color: Color(0xFF4E5968),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -708,136 +887,48 @@ class _EggCharacterWidget extends StatefulWidget {
 }
 
 class _EggCharacterWidgetState extends State<_EggCharacterWidget>
-    with TickerProviderStateMixin {
-  late AnimationController _wobbleCtrl;
-  late AnimationController _pulseCtrl;
-  late Animation<double> _wobble;
-  late Animation<double> _pulse;
+    with SingleTickerProviderStateMixin {
+  AnimationController? _wobbleCtrl;
+  Animation<double>? _wobble;
 
   @override
   void initState() {
     super.initState();
-    // Lv4이면 빠르게 흔들림 (부화 직전)
-    final wobbleMs = widget.level >= 4 ? 120 : 500;
-    _wobbleCtrl = AnimationController(
-      duration: Duration(milliseconds: wobbleMs),
-      vsync: this,
-    )..repeat(reverse: true);
-    _wobble = Tween<double>(begin: -0.07, end: 0.07).animate(
-      CurvedAnimation(parent: _wobbleCtrl, curve: Curves.easeInOut),
-    );
-
-    _pulseCtrl = AnimationController(
-      duration: const Duration(milliseconds: 1200),
-      vsync: this,
-    )..repeat(reverse: true);
-    _pulse = Tween<double>(begin: 1.0, end: 1.06).animate(
-      CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
-    );
+    if (widget.level >= 3) _startWobble();
   }
 
   @override
   void didUpdateWidget(covariant _EggCharacterWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 레벨 변경 시 흔들림 속도 업데이트
-    if (oldWidget.level != widget.level) {
-      final wobbleMs = widget.level >= 4 ? 120 : 500;
-      _wobbleCtrl.duration = Duration(milliseconds: wobbleMs);
-      _wobbleCtrl.repeat(reverse: true);
+    if (widget.level >= 3 && _wobbleCtrl == null) {
+      _startWobble();
+    } else if (_wobbleCtrl != null && widget.level != oldWidget.level) {
+      _wobbleCtrl!.duration = Duration(milliseconds: widget.level >= 4 ? 150 : 400);
+      _wobbleCtrl!.repeat(reverse: true);
     }
+  }
+
+  void _startWobble() {
+    _wobbleCtrl = AnimationController(
+      duration: Duration(milliseconds: widget.level >= 4 ? 150 : 400),
+      vsync: this,
+    )..repeat(reverse: true);
+    _wobble = Tween<double>(begin: -0.06, end: 0.06).animate(
+      CurvedAnimation(parent: _wobbleCtrl!, curve: Curves.easeInOut),
+    );
   }
 
   @override
   void dispose() {
-    _wobbleCtrl.dispose();
-    _pulseCtrl.dispose();
+    _wobbleCtrl?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onPanUpdate: widget.onRubUpdate,
-      behavior: HitTestBehavior.opaque,
-      child: SizedBox(
-        width: 600,
-        height: 600,
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            // 그림자
-            Positioned(
-              bottom: 165,
-              child: Container(
-                width: 120,
-                height: 28,
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.2),
-                  borderRadius: const BorderRadius.all(Radius.elliptical(120, 28)),
-                ),
-              ),
-            ),
-            // 알 본체
-            AnimatedBuilder(
-              animation: Listenable.merge([_wobble, _pulse]),
-              builder: (context, child) {
-                return Transform.rotate(
-                  angle: _wobble.value,
-                  child: Transform.scale(
-                    scale: _pulse.value,
-                    child: child,
-                  ),
-                );
-              },
-              child: _buildEggBody(),
-            ),
-            // 행복 이펙트
-            if (widget.isHappyAction)
-              Positioned(
-                top: 100,
-                child: TweenAnimationBuilder<double>(
-                  tween: Tween(begin: 0.0, end: 1.0),
-                  duration: const Duration(milliseconds: 500),
-                  builder: (context, value, child) {
-                    return Opacity(
-                      opacity: value,
-                      child: Transform.translate(
-                        offset: Offset(0, -40 * value),
-                        child: const Text("❤️", style: TextStyle(fontSize: 40)),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            // 먹기 이펙트
-            if (widget.isEatingAction)
-              Positioned(
-                top: 100,
-                child: TweenAnimationBuilder<double>(
-                  key: ValueKey(DateTime.now().millisecondsSinceEpoch),
-                  tween: Tween(begin: 0.0, end: 1.0),
-                  duration: const Duration(milliseconds: 800),
-                  builder: (context, value, child) {
-                    return Opacity(
-                      opacity: 1.0 - value,
-                      child: Transform.translate(
-                        offset: Offset(0, -60 * value),
-                        child: const Text("🎶", style: TextStyle(fontSize: 40)),
-                      ),
-                    );
-                  },
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildEggBody() {
     final int crackCount = (widget.level - 1).clamp(0, 3);
 
-    return Container(
+    Widget eggBody = Container(
       width: 150,
       height: 195,
       decoration: const BoxDecoration(
@@ -858,7 +949,6 @@ class _EggCharacterWidgetState extends State<_EggCharacterWidget>
       ),
       child: Stack(
         children: [
-          // 광택
           Positioned(
             top: 22,
             left: 28,
@@ -871,59 +961,104 @@ class _EggCharacterWidgetState extends State<_EggCharacterWidget>
               ),
             ),
           ),
-          // 금 (레벨별 균열선)
           if (crackCount > 0)
             Positioned.fill(
               child: CustomPaint(
                 painter: _EggCrackPainter(crackCount: crackCount),
               ),
             ),
-          // 얼굴
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.only(top: 18),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [_buildEye(), const SizedBox(width: 22), _buildEye()],
-                  ),
-                  const SizedBox(height: 10),
-                  // 입
-                  Container(
-                    width: 22,
-                    height: 9,
-                    decoration: BoxDecoration(
-                      border: const Border(
-                        bottom: BorderSide(color: Color(0xFF5D4037), width: 2.5),
-                      ),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
         ],
       ),
     );
-  }
 
-  Widget _buildEye() {
-    return Container(
-      width: 14,
-      height: 14,
-      decoration: const BoxDecoration(
-        color: Color(0xFF3E2723),
-        shape: BoxShape.circle,
-      ),
-      child: Align(
-        alignment: const Alignment(0.3, -0.3),
-        child: Container(
-          width: 4,
-          height: 4,
-          decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+    if (_wobbleCtrl != null && _wobble != null) {
+      eggBody = AnimatedBuilder(
+        animation: _wobbleCtrl!,
+        builder: (context, child) => Transform.rotate(
+          angle: _wobble!.value,
+          child: child,
+        ),
+        child: eggBody,
+      );
+    }
+
+    return GestureDetector(
+      onPanUpdate: widget.onRubUpdate,
+      behavior: HitTestBehavior.opaque,
+      child: SizedBox(
+        width: 600,
+        height: 600,
+        child: Stack(
+          children: [
+            // 그림자
+            Positioned(
+              bottom: 140,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  width: 130,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.22),
+                    borderRadius: const BorderRadius.all(Radius.elliptical(130, 30)),
+                  ),
+                ),
+              ),
+            ),
+            // 알 본체
+            Positioned(
+              bottom: 158,
+              left: 0,
+              right: 0,
+              child: Center(child: eggBody),
+            ),
+            // 행복 이펙트
+            if (widget.isHappyAction)
+              Positioned(
+                top: 100,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: TweenAnimationBuilder<double>(
+                    tween: Tween(begin: 0.0, end: 1.0),
+                    duration: const Duration(milliseconds: 500),
+                    builder: (context, value, child) {
+                      return Opacity(
+                        opacity: value,
+                        child: Transform.translate(
+                          offset: Offset(0, -40 * value),
+                          child: const Text("❤️", style: TextStyle(fontSize: 40)),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            // 먹기 이펙트
+            if (widget.isEatingAction)
+              Positioned(
+                top: 100,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: TweenAnimationBuilder<double>(
+                    key: ValueKey(DateTime.now().millisecondsSinceEpoch),
+                    tween: Tween(begin: 0.0, end: 1.0),
+                    duration: const Duration(milliseconds: 800),
+                    builder: (context, value, child) {
+                      return Opacity(
+                        opacity: 1.0 - value,
+                        child: Transform.translate(
+                          offset: Offset(0, -60 * value),
+                          child: const Text("🎶", style: TextStyle(fontSize: 40)),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -1081,6 +1216,310 @@ class _EvolutionOverlayState extends State<_EvolutionOverlay>
   }
 }
 
+// ─── 수면 오버레이 ────────────────────────────────────────────────────────────
+
+class _SleepOverlay extends StatefulWidget {
+  final int energy;
+  final VoidCallback onWake;
+  const _SleepOverlay({required this.energy, required this.onWake});
+
+  @override
+  State<_SleepOverlay> createState() => _SleepOverlayState();
+}
+
+class _SleepOverlayState extends State<_SleepOverlay> with TickerProviderStateMixin {
+  late AnimationController _zzzCtrl;
+  late Animation<double> _zzzY;
+  late Animation<double> _zzzOpacity;
+  late AnimationController _fadeCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _fadeCtrl = AnimationController(
+      duration: const Duration(milliseconds: 600),
+      vsync: this,
+    )..forward();
+
+    _zzzCtrl = AnimationController(
+      duration: const Duration(milliseconds: 2200),
+      vsync: this,
+    )..repeat();
+
+    _zzzY = Tween<double>(begin: 0, end: -70).animate(
+      CurvedAnimation(parent: _zzzCtrl, curve: Curves.easeOut),
+    );
+    _zzzOpacity = TweenSequence([
+      TweenSequenceItem(tween: Tween<double>(begin: 0.0, end: 1.0), weight: 25),
+      TweenSequenceItem(tween: ConstantTween<double>(1.0), weight: 45),
+      TweenSequenceItem(tween: Tween<double>(begin: 1.0, end: 0.0), weight: 30),
+    ]).animate(_zzzCtrl);
+  }
+
+  @override
+  void dispose() {
+    _fadeCtrl.dispose();
+    _zzzCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _fadeCtrl,
+      child: GestureDetector(
+        onTap: widget.onWake,
+        child: Container(
+          color: const Color(0xEE060B1A),
+          child: SafeArea(
+            child: Stack(
+              children: [
+                // 별 장식
+                const Positioned(top: 60,  left: 40,  child: Text('✦', style: TextStyle(color: Colors.white24, fontSize: 14))),
+                const Positioned(top: 100, right: 60, child: Text('✦', style: TextStyle(color: Colors.white30, fontSize: 10))),
+                const Positioned(top: 40,  right: 100,child: Text('✦', style: TextStyle(color: Colors.white24, fontSize: 18))),
+                const Positioned(top: 160, left: 80,  child: Text('✦', style: TextStyle(color: Colors.white12, fontSize: 12))),
+                // 중앙 콘텐츠
+                Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('🌙', style: TextStyle(fontSize: 64)),
+                      const SizedBox(height: 20),
+                      // 떠오르는 zzz
+                      AnimatedBuilder(
+                        animation: _zzzCtrl,
+                        builder: (context, child) {
+                          return Transform.translate(
+                            offset: Offset(0, _zzzY.value),
+                            child: Opacity(
+                              opacity: _zzzOpacity.value,
+                              child: const Text(
+                                'z  z  z',
+                                style: TextStyle(
+                                  fontSize: 26,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF87CEEB),
+                                  letterSpacing: 6,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 48),
+                      // 에너지 회복 표시
+                      Container(
+                        width: 220,
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.07),
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: Column(
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                const Text(
+                                  '에너지 충전 중',
+                                  style: TextStyle(color: Colors.white60, fontSize: 13),
+                                ),
+                                Text(
+                                  '${widget.energy}%',
+                                  style: const TextStyle(
+                                    color: Color(0xFF87CEEB),
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 15,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 10),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: LinearProgressIndicator(
+                                value: widget.energy / 100.0,
+                                minHeight: 8,
+                                backgroundColor: Colors.white12,
+                                valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF87CEEB)),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 36),
+                      const Text(
+                        '화면을 터치하면 깨어납니다',
+                        style: TextStyle(color: Colors.white24, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── 상점 모달 ────────────────────────────────────────────────────────────────
+
+class _ShopModal extends StatefulWidget {
+  final int gold;
+  final Function(Map<String, dynamic>) onBuy;
+  const _ShopModal({required this.gold, required this.onBuy});
+
+  @override
+  State<_ShopModal> createState() => _ShopModalState();
+}
+
+class _ShopModalState extends State<_ShopModal> {
+  late int _gold;
+
+  static const List<Map<String, dynamic>> _items = [
+    {'name': '케이크',       'emoji': '🎂', 'price': 5,  'fullness': 30, 'mood': 10, 'desc': '포만감·기분 회복'},
+    {'name': '영양제',       'emoji': '💊', 'price': 8,  'fullness': 20, 'energy': 20,'desc': '포만감·에너지'},
+    {'name': '목욕',         'emoji': '🛁', 'price': 6,  'hygiene': 50,              'desc': '위생 +50'},
+    {'name': '향수',         'emoji': '🌸', 'price': 10, 'hygiene': 100,             'desc': '위생 완전 회복'},
+    {'name': '공놀이',       'emoji': '⚽', 'price': 4,  'mood': 20,                 'desc': '기분 +20'},
+    {'name': '에너지 드링크', 'emoji': '⚡', 'price': 12, 'energy': 60,              'desc': '에너지 +60'},
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _gold = widget.gold;
+  }
+
+  void _handleBuy(Map<String, dynamic> item) {
+    final int price = item['price'] as int;
+    if (_gold < price) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('골드가 부족해요!'), duration: Duration(seconds: 1)),
+      );
+      return;
+    }
+    setState(() => _gold -= price);
+    widget.onBuy(item);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.62,
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(
+        children: [
+          Container(
+            margin: const EdgeInsets.only(top: 12),
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.grey[300],
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  '상점',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: Color(0xFF333D4B)),
+                ),
+                Row(
+                  children: [
+                    const Icon(Icons.monetization_on_rounded, color: Color(0xFFF6A000), size: 20),
+                    const SizedBox(width: 4),
+                    Text(
+                      '$_gold',
+                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: Color(0xFF333D4B)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: GridView.builder(
+              padding: const EdgeInsets.all(16),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                childAspectRatio: 0.82,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+              ),
+              itemCount: _items.length,
+              itemBuilder: (context, i) {
+                final item = _items[i];
+                final bool canAfford = _gold >= (item['price'] as int);
+                return GestureDetector(
+                  onTap: () => _handleBuy(item),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: canAfford ? const Color(0xFFF9FAFB) : const Color(0xFFF2F4F6),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: canAfford ? const Color(0xFFE0E0E0) : const Color(0xFFEEEEEE),
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(item['emoji'] as String, style: const TextStyle(fontSize: 30)),
+                        const SizedBox(height: 4),
+                        Text(
+                          item['name'] as String,
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Color(0xFF333D4B)),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          item['desc'] as String,
+                          style: const TextStyle(fontSize: 9, color: Color(0xFF8B95A1)),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: canAfford ? const Color(0xFFF6A000) : Colors.grey[400],
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.monetization_on_rounded, color: Colors.white, size: 11),
+                              const SizedBox(width: 2),
+                              Text(
+                                '${item['price']}',
+                                style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ─── 낙하 사과 ────────────────────────────────────────────────────────────────
 
 class _FallingApple {
@@ -1141,6 +1580,51 @@ class _FallingAppleWidgetState extends State<_FallingAppleWidget>
           ),
         );
       },
+    );
+  }
+}
+
+// ─── 음성 인식 상태 배너 ──────────────────────────────────────────────────────
+
+class _VoiceStatusBanner extends StatelessWidget {
+  final bool isListening;
+  final String statusText;
+  const _VoiceStatusBanner({required this.isListening, required this.statusText});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: isListening
+            ? const Color(0xFF87CEEB).withValues(alpha: 0.95)
+            : Colors.white.withValues(alpha: 0.95),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10, offset: Offset(0, 2))],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            isListening ? Icons.mic_rounded : Icons.check_circle_rounded,
+            color: isListening ? Colors.white : const Color(0xFF87CEEB),
+            size: 18,
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              statusText.isEmpty ? '듣고 있어요...' : statusText,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: isListening ? Colors.white : const Color(0xFF333D4B),
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

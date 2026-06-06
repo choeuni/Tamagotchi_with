@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dart analyze *)",
+      "PowerShell(New-Item *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\User\\\\AndroidStudioProjects\\\\TamaWith\" -Directory)",
+      "Bash(Select-Object Name)",
+      "PowerShell(Head *)",
+      "Bash(flutter analyze *)",
+      "Bash(C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python311\\\\python.exe *)",
+      "PowerShell(& \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python311\\\\python.exe\" -m pip install fastapi uvicorn sqlalchemy 2>&1)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(& \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python311\\\\python.exe\" -c \"import fastapi; import sqlalchemy; import uvicorn; print\\('OK'\\)\")",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"https://unsmooth-nacho-glancing.ngrok-free.dev\" -TimeoutSec 5 -ErrorAction Stop; $r.StatusCode } catch { $_.Exception.Message })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"https://unsmooth-nacho-glancing.ngrok-free.dev\" -TimeoutSec 5 -ErrorAction Stop; $r.Content } catch { $_.Exception.Response | Select-Object StatusCode; $_.Exception.Message })",
+      "PowerShell($resp = Invoke-WebRequest -Uri \"https://unsmooth-nacho-glancing.ngrok-free.dev\" -TimeoutSec 5 -SkipHttpErrorCheck; Write-Output \"Status: $\\($resp.StatusCode\\)\"; Write-Output \"Body: $\\($resp.Content.Substring\\(0, [Math]::Min\\(300, $resp.Content.Length\\)\\)\\)\")",
+      "PowerShell(try { $r = [System.Net.WebRequest]::Create\\(\"https://unsmooth-nacho-glancing.ngrok-free.dev\"\\); $r.Timeout = 5000; $resp = $r.GetResponse\\(\\); $stream = $resp.GetResponseStream\\(\\); $reader = New-Object System.IO.StreamReader\\($stream\\); $reader.ReadToEnd\\(\\).Substring\\(0,200\\) } catch [System.Net.WebException] { $_.Exception.Response.StatusCode; $stream2 = $_.Exception.Response.GetResponseStream\\(\\); $reader2 = New-Object System.IO.StreamReader\\($stream2\\); $reader2.ReadToEnd\\(\\).Substring\\(0,300\\) })",
+      "Bash(flutter devices *)"
+    ]
+  }
+}
